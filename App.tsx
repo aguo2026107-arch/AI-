@@ -17,6 +17,7 @@ const ASPECT_RATIOS = [
 
 const RPM_LIMIT = 60;
 const TIME_WINDOW_MS = 60 * 1000;
+const REQUESTS_PER_GENERATION = 5; // 1 for extraction + 4 for generation
 
 const LoadingSpinner: React.FC = () => (
     <svg className="animate-spin -ml-1 mr-3 h-8 w-8 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -36,6 +37,7 @@ const App: React.FC = () => {
     const [selectedAspectRatio, setSelectedAspectRatio] = useState<string>('9:16');
     const [colorPrompt, setColorPrompt] = useState<string>('');
     const [isLoading, setIsLoading] = useState<boolean>(false);
+    const [isQueued, setIsQueued] = useState<boolean>(false);
     const [loadingStep, setLoadingStep] = useState<string>('');
     const [generatedImages, setGeneratedImages] = useState<string[] | null>(null);
     const [modalImageSrc, setModalImageSrc] = useState<string | null>(null);
@@ -109,77 +111,104 @@ const App: React.FC = () => {
         setLockedSceneImage(null);
     };
 
-    const handleGenerate = useCallback(async () => {
-        const now = Date.now();
-        const recentTimestamps = requestTimestamps.filter(ts => now - ts < TIME_WINDOW_MS);
-        
-        if (recentTimestamps.length >= RPM_LIMIT) {
-            setError(`已达到速率限制 (${RPM_LIMIT} 次/分钟)。请等待额度刷新。`);
-            return;
-        }
-
+    const performGeneration = useCallback(async () => {
         setIsLoading(true);
         setError(null);
         setGeneratedImages(null);
 
         try {
+            // Check quota again right before execution
+            const now = Date.now();
+            const currentTimestamps = requestTimestamps.filter(ts => now - ts < TIME_WINDOW_MS);
+            if (RPM_LIMIT - currentTimestamps.length < REQUESTS_PER_GENERATION) {
+                 setError(`额度不足。需要 ${REQUESTS_PER_GENERATION} 次调用，但当前剩余不足。`);
+                 setIsLoading(false);
+                 return;
+            }
+
             setLoadingStep(uploadedImage ? '转换上传图片中...' : '转换原始图片中...');
             const imageToProcess = uploadedImage
                 ? { base64: uploadedImage.base64, mimeType: uploadedImage.mimeType }
                 : { base64: await urlToBase64(ORIGINAL_IMAGE_URL), mimeType: 'image/jpeg' };
 
-
-            setLoadingStep('从图片中提取服装...');
+            setLoadingStep('从图片中提取服装 (1/5)...');
             const extractedClothingBase64 = await extractClothing(imageToProcess.base64, imageToProcess.mimeType);
-
-            if (!extractedClothingBase64) {
-                throw new Error('无法从图像中提取服装。');
-            }
-            
-            // Record one request for the extraction step
             const afterExtractionTimestamp = Date.now();
-            const generationRequests = lockedSceneImage ? 4 : 4; // Both generate 4 images
-            const totalRequests = 1 + generationRequests;
-            const updatedTimestamps = [...requestTimestamps, afterExtractionTimestamp];
-            
-            const currentQuota = RPM_LIMIT - updatedTimestamps.filter(ts => afterExtractionTimestamp - ts < TIME_WINDOW_MS).length;
-
-            if (currentQuota < generationRequests) {
-                 throw new Error(`额度不足。提取服装后，您还需要 ${generationRequests} 次额度来生成场景，但当前只剩下 ${currentQuota} 次。`);
-            }
-            
-            setRequestTimestamps(prev => [...prev.filter(ts => afterExtractionTimestamp - ts < TIME_WINDOW_MS), afterExtractionTimestamp]);
 
             let newImageBase64Array: string[];
+            const generationStepPrefix = lockedSceneImage ? '在锁定场景中生成' : '生成新场景';
 
             if (lockedSceneImage) {
-                setLoadingStep(`在锁定的场景中生成新服装...`);
+                setLoadingStep(`${generationStepPrefix} (2/5)...`);
                 const { base64: lockedSceneBase64, mimeType: lockedSceneMimeType } = lockedSceneImage;
-                newImageBase64Array = await generateWithLockedScene(extractedClothingBase64, lockedSceneBase64, lockedSceneMimeType, selectedAspectRatio);
+                newImageBase64Array = await generateWithLockedScene(extractedClothingBase64, lockedSceneBase64, lockedSceneMimeType, selectedAspectRatio, (i) => {
+                    setLoadingStep(`${generationStepPrefix} (${i + 2}/5)...`);
+                });
             } else {
-                setLoadingStep(`生成 4 张不同镜头的新场景: ${selectedScene.name}...`);
-                newImageBase64Array = await generateScenes(extractedClothingBase64, selectedScene, selectedAspectRatio, colorPrompt);
+                setLoadingStep(`${generationStepPrefix} (2/5)...`);
+                newImageBase64Array = await generateScenes(extractedClothingBase64, selectedScene, selectedAspectRatio, colorPrompt, (i) => {
+                    setLoadingStep(`${generationStepPrefix} (${i + 2}/5)...`);
+                });
             }
             
             const finalTimestamp = Date.now();
-            const generationTimestamps = Array(newImageBase64Array.length).fill(finalTimestamp);
-            setRequestTimestamps(prev => [...prev, ...generationTimestamps]);
+            const newTimestamps = [
+                afterExtractionTimestamp,
+                ...Array(newImageBase64Array.length).fill(finalTimestamp)
+            ];
 
-
-            if (!newImageBase64Array || newImageBase64Array.length === 0) {
-                 throw new Error('无法生成新场景。');
-            }
+            setRequestTimestamps(prev => {
+                const now = Date.now();
+                const recentPrev = prev.filter(ts => now - ts < TIME_WINDOW_MS);
+                return [...recentPrev, ...newTimestamps];
+            });
 
             setGeneratedImages(newImageBase64Array.map(img => `data:image/png;base64,${img}`));
 
         } catch (err) {
             console.error(err);
-            setError(err instanceof Error ? err.message : '发生意外错误。请再试一次。');
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            
+            // Check for specific quota error messages
+            if (errorMessage.includes('超额') || errorMessage.toLowerCase().includes('quota')) {
+                // It's a quota error. We should queue the request and update our local
+                // rate-limiting to prevent an infinite loop of failed requests.
+                
+                // Add timestamps to our client-side tracker to reflect the failed attempt,
+                // effectively pausing retries until the time window clears.
+                const now = Date.now();
+                const failedAttemptTimestamps = Array(REQUESTS_PER_GENERATION).fill(now);
+                setRequestTimestamps(prev => {
+                    const recentPrev = prev.filter(ts => now - ts < TIME_WINDOW_MS);
+                    return [...recentPrev, ...failedAttemptTimestamps];
+                });
+
+                // Set the state to queued. The UI will update and the useEffect will handle the retry.
+                setIsQueued(true);
+            } else {
+                // It's a different error, so show it to the user.
+                setError(errorMessage);
+            }
         } finally {
             setIsLoading(false);
             setLoadingStep('');
         }
     }, [selectedScene, uploadedImage, selectedAspectRatio, colorPrompt, lockedSceneImage, requestTimestamps]);
+
+    const handleGenerate = useCallback(() => {
+        if (remainingQuota < REQUESTS_PER_GENERATION) {
+            setIsQueued(true);
+        } else {
+            performGeneration();
+        }
+    }, [remainingQuota, performGeneration]);
+
+    useEffect(() => {
+        if (isQueued && remainingQuota >= REQUESTS_PER_GENERATION) {
+            setIsQueued(false);
+            performGeneration();
+        }
+    }, [isQueued, remainingQuota, performGeneration]);
     
     const openModal = (src: string) => setModalImageSrc(src);
     const closeModal = () => setModalImageSrc(null);
@@ -187,11 +216,16 @@ const App: React.FC = () => {
     const isSceneSelectionDisabled = !!lockedSceneImage;
 
     const getQuotaColor = () => {
-        if (remainingQuota === 0) return 'text-red-500';
+        if (remainingQuota < REQUESTS_PER_GENERATION) return 'text-red-500';
         if (remainingQuota <= 10) return 'text-yellow-400';
         return 'text-green-400';
     };
 
+    const getButtonText = () => {
+        if (isLoading) return '生成中...';
+        if (isQueued) return '排队中...';
+        return lockedSceneImage ? '✨ 在锁定场景中生成' : '✨ 生成 4 张新图片';
+    };
 
     return (
         <div className="bg-gray-900 text-white min-h-screen">
@@ -300,26 +334,17 @@ const App: React.FC = () => {
                         <div className="mt-2">
                            <button
                                 onClick={handleGenerate}
-                                disabled={isLoading || remainingQuota <= 0}
+                                disabled={isLoading || isQueued}
                                 className="w-full text-lg font-semibold text-white bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg py-4 px-6 transition-all duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-pink-500/50"
                             >
-                                {isLoading ? '生成中...' : (lockedSceneImage ? '✨ 在锁定场景中生成' : '✨ 生成 4 张新图片')}
+                                {getButtonText()}
                             </button>
                              <div className="mt-4 text-center bg-gray-900/50 p-3 rounded-lg border border-gray-700">
                                 <p className="text-sm font-medium text-gray-200">
                                     当前剩余额度 (1分钟内): <span className={`text-lg font-bold ${getQuotaColor()}`}>{remainingQuota}</span> / {RPM_LIMIT}
                                 </p>
                                 <p className="text-xs text-gray-500 mt-2">
-                                    请注意：API 有使用频率限制（免费版通常为 {RPM_LIMIT} 次/分钟）。如遇“超额”错误，请稍后再试或前往 
-                                    <a 
-                                        href="https://console.cloud.google.com/iam-admin/quotas" 
-                                        target="_blank" 
-                                        rel="noopener noreferrer" 
-                                        className="text-pink-400 hover:underline"
-                                    >
-                                        Google Cloud Console
-                                    </a> 
-                                    查看。
+                                    请注意：API 有使用频率限制（免费版通常为 {RPM_LIMIT} 次/分钟）。额度用尽后请求将自动排队。
                                 </p>
                             </div>
                         </div>
@@ -329,6 +354,13 @@ const App: React.FC = () => {
                     <div className="bg-gray-800/50 rounded-2xl p-6 shadow-2xl backdrop-blur-sm border border-gray-700/50">
                          <h2 className="text-2xl font-semibold mb-4 text-gray-200">AI 生成结果</h2>
                         <div className="aspect-square w-full bg-gray-900/50 rounded-lg flex items-center justify-center border-2 border-dashed border-gray-600 overflow-hidden relative">
+                           {isQueued && !isLoading && (
+                                <div className="absolute inset-0 bg-black/50 flex flex-col items-center justify-center text-center p-4 z-10">
+                                    <p className="text-lg font-semibold">请求已加入队列</p>
+                                    <p className="mt-2 text-sm text-gray-300">正在等待API额度刷新...</p>
+                                    <p className="text-sm text-gray-400">(剩余 <span className={`${getQuotaColor()}`}>{remainingQuota}</span>, 需要 {REQUESTS_PER_GENERATION})</p>
+                                </div>
+                            )}
                            {isLoading && (
                                 <div className="absolute inset-0 bg-black/50 flex flex-col items-center justify-center text-center p-4 z-10">
                                     <LoadingSpinner />
@@ -342,7 +374,7 @@ const App: React.FC = () => {
                                     <p className="text-sm">{error}</p>
                                 </div>
                             )}
-                            {!isLoading && !error && !generatedImages && (
+                            {!isLoading && !isQueued && !error && !generatedImages && (
                                 <div className="text-center text-gray-500 p-4">
                                     <p>您生成的图片将显示在这里。</p>
                                 </div>

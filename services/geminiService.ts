@@ -15,22 +15,33 @@ const CAMERA_SHOTS = [
     '一张动态的低角度照片，使模特看起来充满力量，并强调服装的轮廓。'
 ];
 
-async function processImageGenerationResponse(responsePromise: Promise<any>): Promise<string | null> {
+async function processImageGenerationResponse(responsePromise: Promise<any>): Promise<string> {
     const response = await responsePromise;
-    if (response && response.candidates && response.candidates.length > 0) {
-        const candidate = response.candidates[0];
-        if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
-            for (const part of candidate.content.parts) {
-                if (part.inlineData && part.inlineData.data) {
-                    return part.inlineData.data;
-                }
+
+    // Successful case: find and return image data
+    if (response?.candidates?.[0]?.content?.parts) {
+        for (const part of response.candidates[0].content.parts) {
+            if (part.inlineData?.data) {
+                return part.inlineData.data;
             }
         }
     }
-    return null;
+
+    // Failure case: Analyze reason and throw a descriptive error
+    if (response?.candidates?.[0]?.finishReason === 'SAFETY') {
+        throw new Error('图片生成失败，因为内容可能违反了安全政策。请调整提示词后重试。');
+    }
+
+    const textResponse = response?.text;
+    if (textResponse) {
+        console.error("Unexpected text response from image generation:", textResponse);
+        throw new Error('图片生成失败：模型返回了文本而不是图片。');
+    }
+
+    throw new Error('图片生成失败：收到来自AI的无效或空响应。');
 }
 
-export const extractClothing = async (imageBase64: string, mimeType: string): Promise<string | null> => {
+export const extractClothing = async (imageBase64: string, mimeType: string): Promise<string> => {
     const response = ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
         contents: {
@@ -50,7 +61,7 @@ export const extractClothing = async (imageBase64: string, mimeType: string): Pr
     return processImageGenerationResponse(response);
 };
 
-export const generateWithLockedScene = async (clothingImageBase64: string, sceneImageBase64: string, sceneImageMimeType: string, aspectRatio: string): Promise<string[]> => {
+export const generateWithLockedScene = async (clothingImageBase64: string, sceneImageBase64: string, sceneImageMimeType: string, aspectRatio: string, onProgress?: (index: number) => void): Promise<string[]> => {
     const fullPrompt = `你是一位专业的时尚照片编辑器。你的任务是使用第一张图片（模板图）作为模特、姿势、背景、光照和整体构图的严格模板。你的目标是将第二张图片（服装图）中提供的新服装，智能地替换掉模板图中主要的服装。
 
 重要规则：
@@ -60,8 +71,8 @@ export const generateWithLockedScene = async (clothingImageBase64: string, scene
 
 最终的图片应该是一张高分辨率、照片般逼真的时尚照片，它看起来就像是模板图的另一个版本，只是服装不同。`;
 
-    // We generate 4 images for consistency in the UI grid
-    const generationPromises = Array(4).fill(0).map(() => {
+    const generationPromises = Array(4).fill(0).map((_, i) => {
+        onProgress?.(i);
         const responsePromise = ai.models.generateContent({
             model: 'gemini-2.5-flash-image',
             contents: {
@@ -90,22 +101,29 @@ export const generateWithLockedScene = async (clothingImageBase64: string, scene
         return processImageGenerationResponse(responsePromise);
     });
 
-    const results = await Promise.all(generationPromises);
-    const successfulResults = results.filter((result): result is string => result !== null);
-
-    if (successfulResults.length < 4) {
-        console.warn(`只成功生成了 ${successfulResults.length} / 4 张锁定场景图片。`);
-    }
+    const results = await Promise.allSettled(generationPromises);
+    const successfulResults: string[] = [];
+    results.forEach(result => {
+        if (result.status === 'fulfilled') {
+            successfulResults.push(result.value);
+        } else {
+            console.error("A single image generation failed:", result.reason);
+        }
+    });
 
     if (successfulResults.length === 0) {
-        throw new Error('无法在锁定场景中生成任何图片。');
+        const firstRejection = results.find(r => r.status === 'rejected') as PromiseRejectedResult | undefined;
+        if (firstRejection) {
+            throw firstRejection.reason;
+        }
+        throw new Error('所有图片生成均失败。请检查您的提示词或稍后再试。');
     }
 
     return successfulResults;
 };
 
 
-export const generateScenes = async (clothingImageBase64: string, scene: Scene, aspectRatio: string, colorPrompt?: string): Promise<string[]> => {
+export const generateScenes = async (clothingImageBase64: string, scene: Scene, aspectRatio: string, colorPrompt?: string, onProgress?: (index: number) => void): Promise<string[]> => {
     
     let scenePrompt = scene.prompt;
 
@@ -119,7 +137,8 @@ export const generateScenes = async (clothingImageBase64: string, scene: Scene, 
 
     const isComplexPrompt = scenePrompt.includes('人物') || scenePrompt.includes('模特') || scenePrompt.length > 200;
 
-    const generationPromises = CAMERA_SHOTS.map(shot => {
+    const generationPromises = CAMERA_SHOTS.map((shot, i) => {
+        onProgress?.(i);
         let fullPrompt: string;
 
         if (isComplexPrompt) {
@@ -152,16 +171,22 @@ export const generateScenes = async (clothingImageBase64: string, scene: Scene, 
         return processImageGenerationResponse(responsePromise);
     });
 
-    const results = await Promise.all(generationPromises);
-    
-    const successfulResults = results.filter((result): result is string => result !== null);
-
-    if (successfulResults.length < 4) {
-         console.warn(`只成功生成了 ${successfulResults.length} / 4 张新场景图片。`);
-    }
+    const results = await Promise.allSettled(generationPromises);
+    const successfulResults: string[] = [];
+    results.forEach(result => {
+        if (result.status === 'fulfilled') {
+            successfulResults.push(result.value);
+        } else {
+            console.error("A single image generation failed:", result.reason);
+        }
+    });
 
     if (successfulResults.length === 0) {
-        throw new Error('无法生成任何图片。');
+        const firstRejection = results.find(r => r.status === 'rejected') as PromiseRejectedResult | undefined;
+        if (firstRejection) {
+            throw firstRejection.reason;
+        }
+        throw new Error('所有图片生成均失败。请检查您的提示词或稍后再试。');
     }
 
     return successfulResults;
