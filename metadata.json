@@ -1,0 +1,5 @@
+{
+  "name": "AI 时尚场景设计师",
+  "description": "从图像中提取服装，并通过选择不同的场景将其重新设计成新的产品图。该应用使用 AI 生成新的时尚摄影作品。",
+  "requestFramePermissions": []
+}
